@@ -21,9 +21,6 @@ static const char *TAG = "REC_PLAY";
 /* Frecuencia de muestreo bajada a 16000 Hz para probar mejoras de audio */
 #define SAMPLE_RATE 16000
 
-/* Tiempo de grabación vuelto a 5 segundos. */
-#define RECORD_TIME_SEC 5
-
 i2s_chan_handle_t rx_chan; // Handle del Micrófono
 i2s_chan_handle_t tx_chan; // Handle del Altavoz
 
@@ -64,7 +61,7 @@ void spk_init(void) {
   i2s_std_config_t tx_std_cfg = {
       .clk_cfg = I2S_STD_CLK_DEFAULT_CONFIG(SAMPLE_RATE),
       .slot_cfg = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_16BIT,
-                                                      I2S_SLOT_MODE_STEREO),
+                                                      I2S_SLOT_MODE_MONO),
       .gpio_cfg =
           {
               .mclk = I2S_GPIO_UNUSED,
@@ -92,110 +89,57 @@ void app_main(void) {
   ESP_LOGI(TAG, "Inicializando Altavoz MAX98357A...");
   spk_init();
 
-  // Calculamos el tamaño del buffer necesario para almacenar el audio
-  const int total_samples = SAMPLE_RATE * RECORD_TIME_SEC;
-
-  // Almacenamos en Mono para ahorrar RAM
-  // Buffer = (Total muestras) * (2 bytes por muestra (16 bit))
-  int16_t *audio_buffer = (int16_t *)calloc(total_samples, sizeof(int16_t));
-  if (audio_buffer == NULL) {
-    ESP_LOGE(TAG, "No hay memoria RAM suficiente para el buffer de grabacion.");
-    return;
-  }
-
-  // Buffer temporal para leer fragmentos pequeños desde el micrófono (32 bits)
-  const int chunk_samples = 512;
+  // Buffer temporal para leer fragmentos desde el micrófono (Stereo 32-bits)
+  const int chunk_samples = 512; // Número de muestras por lectura
   int32_t *i2s_read_buff = (int32_t *)calloc(chunk_samples, sizeof(int32_t));
-  if (i2s_read_buff == NULL) {
-    ESP_LOGE(TAG, "Error asignando memoria para fragmentos de lectura.");
-    free(audio_buffer);
+  
+  // Buffer temporal para enviar al altavoz (Mono 16-bits)
+  // Como leemos estéreo pero guardamos mono, el tamaño de salida es la mitad
+  int16_t *i2s_write_buff = (int16_t *)calloc(chunk_samples / 2, sizeof(int16_t));
+
+  if (i2s_read_buff == NULL || i2s_write_buff == NULL) {
+    ESP_LOGE(TAG, "Error asignando memoria para buffers.");
     return;
   }
+
+  ESP_LOGI(TAG, ">>> MODO INTERCOMUNICADOR INICIADO <<<");
+  ESP_LOGI(TAG, "Habla al micrófono. El audio se reproducirá en tiempo real.");
 
   while (1) {
-    // -------------------------
-    // FASE 1: GRABAR
-    // -------------------------
-    ESP_LOGI(TAG, "Preparando para grabar...");
-    ESP_LOGI(TAG, "3...");
-    vTaskDelay(pdMS_TO_TICKS(1000));
-    ESP_LOGI(TAG, "2...");
-    vTaskDelay(pdMS_TO_TICKS(1000));
-    ESP_LOGI(TAG, "1...");
-    vTaskDelay(pdMS_TO_TICKS(1000));
+    size_t bytes_read = 0;
+    
+    // 1. Leer del Micrófono (Estéreo, 32 bits)
+    esp_err_t err = i2s_channel_read(rx_chan, i2s_read_buff,
+                                     chunk_samples * sizeof(int32_t),
+                                     &bytes_read, portMAX_DELAY);
 
-    // Reiniciar el canal I2S para limpiar cualquier audio viejo atascado en el buffer DMA
-    i2s_channel_disable(rx_chan);
-    i2s_channel_enable(rx_chan);
+    if (err == ESP_OK && bytes_read > 0) {
+      int samples_read = bytes_read / sizeof(int32_t);
+      int write_idx = 0;
 
-    ESP_LOGI(TAG, ">>> GRABANDO (%d SEGUNDOS) <<<", RECORD_TIME_SEC);
-    size_t samples_recorded = 0;
+      // 2. Procesar datos: Extraer canal izquierdo (i += 2)
+      for (int i = 0; i < samples_read; i += 2) {
+        // Desplazar 14 bits (preserva volumen y calidad)
+        int32_t raw_sample = i2s_read_buff[i] >> 14;
 
-    while (samples_recorded < total_samples) {
-      size_t bytes_read = 0;
-      // Leemos del I2S del micrófono
-      esp_err_t err = i2s_channel_read(rx_chan, i2s_read_buff,
-                                       chunk_samples * sizeof(int32_t),
-                                       &bytes_read, portMAX_DELAY);
+        // Filtro para remover el Offset DC
+        static int32_t dc_offset = 0;
+        dc_offset = (dc_offset * 127 + raw_sample) / 128;
+        int32_t sample32 = raw_sample - dc_offset;
 
-      if (err == ESP_OK && bytes_read > 0) {
-        int samples_read = bytes_read / sizeof(int32_t);
+        // Limitador para evitar saturación
+        if (sample32 > 32767) sample32 = 32767;
+        if (sample32 < -32768) sample32 = -32768;
 
-        // Al estar en modo STEREO, el buffer recibe Izquierdo, Derecho, Izquierdo, Derecho...
-        // Iteramos de 2 en 2 (i += 2) para extraer ÚNICAMENTE el canal Izquierdo (donde está el micro)
-        // e ignorar la basura del canal Derecho.
-        for (int i = 0; i < samples_read; i += 2) {
-          if (samples_recorded >= total_samples)
-            break; // Buffer principal lleno
-
-          // Leemos a 32 bits y desplazamos 14 bits para tener buen volumen
-          int32_t raw_sample = i2s_read_buff[i] >> 14;
-
-          // 1. Filtro para remover el Offset DC
-          static int32_t dc_offset = 0;
-          dc_offset = (dc_offset * 127 + raw_sample) / 128;
-          int32_t sample32 = raw_sample - dc_offset;
-
-          // 2. Limitador para evitar saturación absoluta
-          if (sample32 > 32767) sample32 = 32767;
-          if (sample32 < -32768) sample32 = -32768;
-
-          // Guardamos la muestra en el buffer
-          audio_buffer[samples_recorded] = (int16_t)sample32;
-
-          samples_recorded++;
-        }
-      } else {
-        ESP_LOGE(TAG, "Error al leer datos del I2S.");
+        // Guardar la muestra Mono de 16-bits en el buffer de escritura
+        i2s_write_buff[write_idx++] = (int16_t)sample32;
       }
+
+      // 3. Escribir al Altavoz (Mono, 16 bits)
+      size_t bytes_written = 0;
+      i2s_channel_write(tx_chan, i2s_write_buff,
+                        write_idx * sizeof(int16_t),
+                        &bytes_written, portMAX_DELAY);
     }
-
-    // -------------------------
-    // FASE 2: ENVIAR AL PC POR PUERTO SERIE
-    // -------------------------
-    ESP_LOGI(TAG, ">>> ENVIANDO AUDIO POR SERIAL <<<");
-
-    // Imprimir marcadores para que el script de Python los detecte
-    printf("\n---BEGIN_AUDIO---\n");
-
-    // Imprimir las muestras en formato hexadecimal.
-    // Hacemos que cada línea tenga 32 valores para no saturar el buffer del
-    // print.
-    for (int i = 0; i < total_samples; i++) {
-      // Imprimimos el valor como entero sin signo de 16 bits en Hex.
-      printf("%04X", (uint16_t)audio_buffer[i]);
-      if ((i + 1) % 32 == 0) {
-        printf("\n");
-        // Pausa breve para evitar que salte el Watchdog de FreeRTOS por estar imprimiendo tanto tiempo seguido
-        if ((i + 1) % 3200 == 0) {
-            vTaskDelay(pdMS_TO_TICKS(10));
-        }
-      }
-    }
-
-    printf("\n---END_AUDIO---\n");
-    ESP_LOGI(TAG, ">>> ENVÍO COMPLETADO <<<");
-    ESP_LOGI(TAG, "Esperando 5 segundos para volver a grabar...");
-    vTaskDelay(pdMS_TO_TICKS(5000));
   }
 }
