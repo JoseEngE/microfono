@@ -4,6 +4,7 @@
 #include "freertos/task.h"
 #include "esp_log.h"
 #include "driver/i2s_std.h"
+#include "driver/i2s_pdm.h"
 
 static const char *TAG = "REC_PLAY";
 
@@ -12,10 +13,10 @@ static const char *TAG = "REC_PLAY";
 #define I2S_MIC_BCK_IO 12
 #define I2S_MIC_DI_IO 10
 
-/* Configuración de los pines I2S Altavoz (MAX98357A) */
-#define I2S_SPK_BCLK_IO 4
-#define I2S_SPK_WS_IO 5
-#define I2S_SPK_DOUT_IO 18
+/* Configuración de los pines para el Altavoz analógico HW-104 (PAM8403) */
+#define I2S_SPK_BCLK_IO I2S_GPIO_UNUSED // No se necesita reloj para PDM en modo DAC
+#define I2S_SPK_WS_IO I2S_GPIO_UNUSED   // No se necesita WS
+#define I2S_SPK_DOUT_IO 17              // Nuevo pin para la señal analógica (HW-104)
 
 /* Frecuencia de muestreo estándar (32000 Hz) para que el altavoz sincronice perfecto */
 #define SAMPLE_RATE 32000
@@ -55,24 +56,21 @@ void spk_init(void) {
     i2s_chan_config_t tx_chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_AUTO, I2S_ROLE_MASTER);
     ESP_ERROR_CHECK(i2s_new_channel(&tx_chan_cfg, &tx_chan, NULL));
 
-    i2s_std_config_t tx_std_cfg = {
-        .clk_cfg = I2S_STD_CLK_DEFAULT_CONFIG(SAMPLE_RATE),
-        .slot_cfg = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_16BIT, I2S_SLOT_MODE_STEREO),
+    // Configuración PDM (Pulse Density Modulation) para salida analógica (DAC mode)
+    // Esto genera una señal que puede conectarse al HW-104 (recomendable usar un filtro RC: 1k ohm + 100nF a tierra)
+    i2s_pdm_tx_config_t pdm_tx_cfg = {
+        .clk_cfg = I2S_PDM_TX_CLK_DAC_DEFAULT_CONFIG(SAMPLE_RATE),
+        .slot_cfg = I2S_PDM_TX_SLOT_DAC_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_16BIT, I2S_SLOT_MODE_MONO),
         .gpio_cfg = {
-            .mclk = I2S_GPIO_UNUSED,
-            .bclk = I2S_SPK_BCLK_IO,
-            .ws = I2S_SPK_WS_IO,
+            .clk = I2S_SPK_BCLK_IO,
             .dout = I2S_SPK_DOUT_IO,
-            .din  = I2S_GPIO_UNUSED,
             .invert_flags = {
-                .mclk_inv = false,
-                .bclk_inv = false,
-                .ws_inv   = false,
+                .clk_inv = false,
             },
         },
     };
 
-    ESP_ERROR_CHECK(i2s_channel_init_std_mode(tx_chan, &tx_std_cfg));
+    ESP_ERROR_CHECK(i2s_channel_init_pdm_tx_mode(tx_chan, &pdm_tx_cfg));
     ESP_ERROR_CHECK(i2s_channel_enable(tx_chan));
 }
 
